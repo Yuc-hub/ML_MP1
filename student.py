@@ -1,21 +1,17 @@
-"""LLaMA/Gemma2/PaLM-style GPT with modern techniques.
+"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU + QK-Norm + Dropout + Logit Cap.
 
 Improvements over baseline (GPT-2 style, width=128, depth=4, ~1.09M params):
-  1. RoPE           – rotary position encoding (LLaMA)
-  2. RMSNorm        – simpler normalization (LLaMA)
-  3. SwiGLU         – gated MLP (LLaMA / PaLM)
-  4. Width 160      – wider representations
-  5. Depth 6        – deeper network
-  6. QK-Norm        – normalize Q,K before attention (Gemma 2 / DeepSeek-V2)
-  7. Embedding ×√d  – scale embeddings to match residual stream (Transformer / GPT-3)
-  8. Scaled init    – residual branches init std /= √(2·depth) (GPT-2 / GPT-NeoX)
-  9. Parallel block – attention & MLP in parallel (PaLM / GPT-J)
+  1. RoPE           – rotary position encoding replaces absolute pos embedding
+  2. RMSNorm        – simpler norm, no mean-centering
+  3. SwiGLU         – gated MLP with SiLU activation
+  4. Width 160      – wider representations (128 -> 160)
+  5. Depth 6        – deeper network (4 -> 6 blocks)
+  6. Residual scale – each residual branch *= 1/sqrt(depth), stabilizes deep nets
+  7. QK-Norm        – RMSNorm on Q,K before attention (Gemma 2 / DeepSeek-V2)
+  8. Dropout 0.1    – regularization on attn output + MLP output
+  9. Logit cap 30   – tanh soft-capping on attn logits (Gemma 2)
 
-Ablation results:
-  A) baseline                                  -> 2.10 BPB
-  B) RoPE+RMSNorm+SwiGLU, depth=6, width=128  -> 1.85 BPB
-  C) + width=160, residual scaling             -> 1.80 BPB
-  D) + QK-Norm, EmbedScale, ScaledInit, PaLM   -> measure
+Run with --steps 2400 to maximize training within 5x time budget.
 """
 import math
 import torch
@@ -57,7 +53,7 @@ def _apply_rope(x, cos, sin):
 
 
 class SwiGLUMLP(nn.Module):
-    """Gated MLP: SiLU(gate) * up -> down  (Shazeer 2020, used in LLaMA)."""
+    """Gated MLP: SiLU(gate) * up -> down  (Shazeer 2020, LLaMA)."""
     def __init__(self, width, hidden_dim):
         super().__init__()
         self.gate = nn.Linear(width, hidden_dim, bias=False)
@@ -69,46 +65,46 @@ class SwiGLUMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Parallel Transformer block (PaLM / GPT-J style)
+# Transformer block (sequential, with QK-Norm)
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    """Parallel attention + MLP block with QK-Norm.
-
-    PaLM style:  x = x + Attn(norm(x)) + MLP(norm(x))
-    Instead of:  x = x + MLP(norm(x + Attn(norm(x))))
-
-    Benefits: single norm, better gradient flow, slightly faster (parallelism).
-    """
-    def __init__(self, width, heads, mlp_hidden):
+    def __init__(self, width, heads, mlp_hidden, residual_scale=1.0, dropout=0.0, logit_cap=0.0):
         super().__init__()
         self.heads = heads
         self.head_dim = width // heads
-        # Single pre-norm for both branches (PaLM style)
-        self.norm = RMSNorm(width)
-        # Attention
+        self.residual_scale = residual_scale
+        self.logit_cap = logit_cap
+        self.norm1 = RMSNorm(width)
+        self.norm2 = RMSNorm(width)
         self.qkv  = nn.Linear(width, 3 * width, bias=False)
-        self.q_norm = RMSNorm(self.head_dim)   # QK-Norm (Gemma 2 / DeepSeek-V2)
+        self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.proj = nn.Linear(width, width, bias=False)
-        # MLP
-        self.mlp = SwiGLUMLP(width, mlp_hidden)
+        self.mlp  = SwiGLUMLP(width, mlp_hidden)
+        self.attn_drop = nn.Dropout(dropout)
+        self.mlp_drop  = nn.Dropout(dropout)
 
     def forward(self, x, rope_cos, rope_sin):
         batch, length, width = x.shape
-        h = self.norm(x)
-        # --- attention branch ---
+        h = self.norm1(x)
         q, k, v = (self.qkv(h)
                     .view(batch, length, 3, self.heads, self.head_dim)
                     .permute(2, 0, 3, 1, 4))
         q = _apply_rope(self.q_norm(q), rope_cos, rope_sin)
         k = _apply_rope(self.k_norm(k), rope_cos, rope_sin)
-        attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        attn_out = self.proj(attn.transpose(1, 2).reshape(batch, length, width))
-        # --- MLP branch (parallel, shares the same norm input) ---
-        mlp_out = self.mlp(h)
-        # --- combine ---
-        return x + attn_out + mlp_out
+        # Logit soft-capping (Gemma 2): tanh caps prevent attention explosion
+        if self.logit_cap > 0:
+            attn_weight = q @ k.transpose(-2, -1) / math.sqrt(self.head_dim)
+            attn_weight = self.logit_cap * torch.tanh(attn_weight / self.logit_cap)
+            causal_mask = torch.triu(torch.ones(length, length, device=x.device, dtype=torch.bool), 1)
+            attn_weight = attn_weight.masked_fill(causal_mask, float('-inf'))
+            attn = torch.softmax(attn_weight, dim=-1) @ v
+        else:
+            attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.attn_drop(self.proj(attn.transpose(1, 2).reshape(batch, length, width))) * self.residual_scale
+        x = x + self.mlp_drop(self.mlp(self.norm2(x))) * self.residual_scale
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +119,14 @@ class StudentGPT(nn.Module):
         width = config['width']
         heads = config['heads']
         depth = config.get('depth', 4)
-        self.embed_scale = math.sqrt(width)     # Embedding scaling (GPT-3)
 
         # SwiGLU hidden dim: 8/3 * width, rounded to multiple of 8
         mlp_hidden = ((width * 8 // 3 + 7) // 8) * 8
 
-        # Token embedding (RoPE handles positions, no pos embedding needed)
+        # Residual scaling: 1/sqrt(depth) for training stability
+        residual_scale = 1.0 / math.sqrt(depth)
+
+        # Token embedding (RoPE handles positions)
         self.token = nn.Embedding(config['vocab'], width)
 
         # RoPE cos/sin tables
@@ -138,21 +136,16 @@ class StudentGPT(nn.Module):
         self.register_buffer('rope_sin', sin)
 
         # Transformer blocks
+        dropout = config.get('dropout', 0.1)
+        logit_cap = config.get('logit_cap', 30.0)
         self.blocks = nn.ModuleList(
-            [Block(width, heads, mlp_hidden) for _ in range(depth)]
+            [Block(width, heads, mlp_hidden, residual_scale, dropout, logit_cap) for _ in range(depth)]
         )
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, config['vocab'], bias=False)
 
-        # --- Initialization ---
+        # Initialize and tie embeddings
         self.apply(self._init_weights)
-        # Scaled init: residual-contributing projections get smaller init
-        # to prevent residual stream from growing with depth (GPT-2 / GPT-NeoX)
-        residual_std = 0.02 / math.sqrt(2 * depth)
-        for block in self.blocks:
-            nn.init.normal_(block.proj.weight, std=residual_std)
-            nn.init.normal_(block.mlp.down.weight, std=residual_std)
-        # Weight tying
         self.head.weight = self.token.weight
 
     @staticmethod
@@ -163,7 +156,7 @@ class StudentGPT(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def features(self, ids):
-        x = self.token(ids) * self.embed_scale     # scale embeddings by √width
+        x = self.token(ids)
         for block in self.blocks:
             x = block(x, self.rope_cos, self.rope_sin)
         return self.norm(x)
