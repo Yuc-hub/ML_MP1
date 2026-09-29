@@ -1,18 +1,18 @@
-"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU, deeper (6 layers vs baseline 4).
+"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU + wider (160) + residual scaling.
 
-Diagnosis: the baseline uses absolute position embeddings, LayerNorm, and a
-plain GELU MLP.  Modern LLM research (LLaMA, Llama-2) shows that swapping
-these for RoPE, RMSNorm, and SwiGLU consistently lowers loss at matched
-parameter counts.  The parameter savings from removing the learned position
-embedding (~33K) plus a slight SwiGLU hidden-dim adjustment let us add two
-extra transformer blocks (4 -> 6) within budget.
+Improvements over baseline (GPT-2 style, width=128, depth=4, ~1.09M params):
+  1. RoPE       – rotary position encoding replaces absolute pos embedding
+  2. RMSNorm    – simpler norm, no mean-centering
+  3. SwiGLU     – gated MLP with SiLU activation
+  4. Width 160  – wider representations (128 -> 160)
+  5. Depth 6    – deeper network (4 -> 6 blocks)
+  6. Residual scaling – multiply each residual by 1/sqrt(depth) for stability
 
-Ablation plan (to isolate each mechanism):
-  A) baseline                        -> ~2.10 BPB  (reference)
-  B) baseline + RoPE only            -> measure
-  C) baseline + RMSNorm only         -> measure
-  D) baseline + SwiGLU only          -> measure
-  E) full (RoPE+RMSNorm+SwiGLU, 6L) -> target < 2.10
+Ablation plan:
+  A) baseline                                -> ~2.10 BPB
+  B) RoPE+RMSNorm+SwiGLU, depth=6, width=128 -> 1.85 BPB
+  C) + width=160, depth=6                     -> measure
+  D) + residual scaling                       -> measure
 """
 import math
 import torch
@@ -73,10 +73,11 @@ class SwiGLUMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    def __init__(self, width, heads, mlp_hidden):
+    def __init__(self, width, heads, mlp_hidden, residual_scale=1.0):
         super().__init__()
         self.heads = heads
         self.head_dim = width // heads
+        self.residual_scale = residual_scale
         self.norm1 = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.qkv  = nn.Linear(width, 3 * width, bias=False)
@@ -93,9 +94,9 @@ class Block(nn.Module):
         q = _apply_rope(q, rope_cos, rope_sin)
         k = _apply_rope(k, rope_cos, rope_sin)
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.proj(attn.transpose(1, 2).reshape(batch, length, width))
+        x = x + self.proj(attn.transpose(1, 2).reshape(batch, length, width)) * self.residual_scale
         # --- feed-forward ---
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x)) * self.residual_scale
         return x
 
 
@@ -113,7 +114,10 @@ class StudentGPT(nn.Module):
         depth = config.get('depth', 4)
 
         # SwiGLU hidden dim: 8/3 * width, rounded up to multiple of 8
-        mlp_hidden = ((width * 8 // 3 + 7) // 8) * 8    # 128 -> 344
+        mlp_hidden = ((width * 8 // 3 + 7) // 8) * 8    # 160 -> 432
+
+        # Residual scaling factor: 1/sqrt(depth) for training stability
+        residual_scale = 1.0 / math.sqrt(depth)
 
         # Token embedding (no position embedding -- RoPE handles positions)
         self.token = nn.Embedding(config['vocab'], width)
@@ -124,9 +128,9 @@ class StudentGPT(nn.Module):
         self.register_buffer('rope_cos', cos)
         self.register_buffer('rope_sin', sin)
 
-        # Transformer blocks
+        # Transformer blocks with residual scaling
         self.blocks = nn.ModuleList(
-            [Block(width, heads, mlp_hidden) for _ in range(depth)]
+            [Block(width, heads, mlp_hidden, residual_scale) for _ in range(depth)]
         )
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, config['vocab'], bias=False)
@@ -163,5 +167,7 @@ class StudentGPT(nn.Module):
 
 def build_model(config):
     improved = dict(config)
+    improved['width'] = 160     # wider:  128 -> 160
+    improved['heads'] = 5       # heads:  4 -> 5  (head_dim = 32)
     improved['depth'] = 6       # deeper: 4 -> 6 blocks
     return StudentGPT(improved)
