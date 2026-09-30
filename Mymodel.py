@@ -1,4 +1,17 @@
-"""Width-160 GPT with SwiGLU, RMSNorm, RoPE, and gated attention."""
+"""Width-160 causal LM; experiment notes are kept here for run tracking.
+
+# try01: SwiGLU
+# try02: width: 128 -> 160
+# try03: depth: 4 -> 6
+# try04: RMSNorm 替换 LayerNorm
+# try05: RoPE 替换绝对位置嵌入
+# try06: 增加 QK-RMSNorm 和门控
+# try07: 实现 8Q/4KV + 保留现有 QK-RMSNorm 和门控
+# try08: 10 Q / 5 KV
+# try09: Value Residual：后续层复用第 1 层的 Value；每头系数零初始化、可学习
+
+以上为实验记录；具体运行结果请与对应 run 目录中的指标一并记录。
+"""
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -18,62 +31,36 @@ class SwiGLU(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, width, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(width))
-        self.eps = eps
-
-    def forward(self, x):
-        scale = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return (x.float() * scale).type_as(x) * self.weight
-
-
-def precompute_rope(head_dim, context, base=10000.0):
-    frequencies = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
-    positions = torch.arange(context, dtype=torch.float32)
-    angles = torch.outer(positions, frequencies)
-    return angles.cos(), angles.sin()
-
-
-def apply_rope(x, cos, sin):
-    seq_len = x.shape[2]
-    cos = cos[:seq_len].to(device=x.device, dtype=x.dtype)[None, None, :, :]
-    sin = sin[:seq_len].to(device=x.device, dtype=x.dtype)[None, None, :, :]
-    first, second = x.chunk(2, dim=-1)
-    return torch.cat((first * cos - second * sin,
-                      second * cos + first * sin), dim=-1)
-
-
 class Block(nn.Module):
     def __init__(self, width, heads):
         super().__init__()
         self.heads = heads
-        head_dim = width // heads
-        self.norm1 = RMSNorm(width)
-        self.norm2 = RMSNorm(width)
+        self.norm1 = nn.LayerNorm(width)
+        self.norm2 = nn.LayerNorm(width)
         self.qkv = nn.Linear(width, 3 * width)
-        self.q_norm = RMSNorm(head_dim)
-        self.k_norm = RMSNorm(head_dim)
-        self.attn_gate = nn.Linear(width, heads)
         self.proj = nn.Linear(width, width)
         self.mlp = SwiGLU(width)
 
-    def forward(self, x, rope_cos, rope_sin):
+    def forward(self, x, first_value=None):
         batch, length, width = x.shape
-        h = self.norm1(x)
-        q, k, v = self.qkv(h).view(
+        q, k, v = self.qkv(self.norm1(x)).view(
             batch, length, 3, self.heads, width // self.heads
         ).permute(2, 0, 3, 1, 4)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q = apply_rope(q, rope_cos, rope_sin)
-        k = apply_rope(k, rope_cos, rope_sin)
+        # Value Residual: later layers can reuse the first layer's value stream.
+        # A zero-initialized per-head coefficient keeps the starting model
+        # exactly equivalent to the original attention and lets training learn
+        # whether (and how strongly) the earlier features are useful.
+        if first_value is not None:
+            v = v + self.value_residual * first_value
         attended = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        gate = torch.sigmoid(self.attn_gate(h)).transpose(1, 2).unsqueeze(-1)
-        attended = attended * gate
         x = x + self.proj(attended.transpose(1, 2).reshape(batch, length, width))
-        return x + self.mlp(self.norm2(x))
+        return x + self.mlp(self.norm2(x)), v
+
+    def add_value_residual(self, heads):
+        # One learned mixing weight per attention head, initialized to zero so
+        # the feature path is introduced gradually instead of perturbing the
+        # baseline at initialization.
+        self.value_residual = nn.Parameter(torch.zeros(1, heads, 1, 1))
 
 
 class GPT(nn.Module):
@@ -83,17 +70,18 @@ class GPT(nn.Module):
         self.context = config['context']
         width = config['width']
         self.token = nn.Embedding(config['vocab'], width)
-        rope_cos, rope_sin = precompute_rope(width // config['heads'], self.context)
-        self.register_buffer('rope_cos', rope_cos)
-        self.register_buffer('rope_sin', rope_sin)
+        self.pos = nn.Embedding(self.context, width)
         self.blocks = nn.ModuleList(
             [Block(width, config['heads']) for _ in range(config['depth'])]
         )
-        self.norm = RMSNorm(width)
+        # Keep the first block as the source of an optional long-range value
+        # shortcut; block 0 itself has no shortcut, while deeper blocks learn
+        # independent per-head mixing strengths.
+        for block in self.blocks[1:]:
+            block.add_value_residual(config['heads'])
+        self.norm = nn.LayerNorm(width)
         self.head = nn.Linear(width, config['vocab'], bias=False)
         self.apply(self.initialize)
-        for block in self.blocks:
-            nn.init.constant_(block.attn_gate.bias, 2.0)
         self.head.weight = self.token.weight
 
     @staticmethod
@@ -104,9 +92,15 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def features(self, ids):
-        x = self.token(ids)
-        for block in self.blocks:
-            x = block(x, self.rope_cos, self.rope_sin)
+        positions = torch.arange(ids.shape[1], device=ids.device)
+        x = self.token(ids) + self.pos(positions)
+        first_value = None
+        for index, block in enumerate(self.blocks):
+            x, value = block(x, first_value if index > 0 else None)
+            if index == 0:
+                # Reuse the first layer's projected value tensor as a direct
+                # attention-value source in all subsequent layers.
+                first_value = value
         return self.norm(x)
 
     def forward(self, ids):
@@ -119,6 +113,4 @@ class GPT(nn.Module):
 def build_model(config):
     model_config = dict(config)
     model_config['width'] = 160
-    model_config['depth'] = 6
-    model_config['heads'] = 5
     return GPT(model_config)
