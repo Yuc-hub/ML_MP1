@@ -1,18 +1,17 @@
-"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU + QK-Norm + Dropout.
+"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU + QK-Norm, wider & deeper.
 
 Improvements over baseline (GPT-2 style, width=128, depth=4, ~1.09M params):
   1. RoPE           – rotary position encoding (LLaMA)
   2. RMSNorm        – simpler norm, no mean-centering (LLaMA)
   3. SwiGLU         – gated MLP with SiLU activation (LLaMA/PaLM)
-  4. Width 160      – wider representations
-  5. Depth 6        – deeper network
-  6. Residual scale – 1/sqrt(depth) per residual branch (DeepSeek-V2)
-  7. QK-Norm        – RMSNorm on Q,K before attention (Gemma 2)
-  8. Dropout 0.05   – light regularization on attn/MLP/embedding
+  4. Width 160      – wider representations (128 -> 160)
+  5. Depth 6        – deeper network (4 -> 6 blocks)
+  6. Residual scale – each residual branch *= 1/sqrt(depth) (DeepSeek-V2)
+  7. QK-Norm        – RMSNorm on Q,K before attention (Gemma 2 / DeepSeek-V2)
 
-Best so far: test04 = 1.7619 BPB (1200 steps, no dropout)
-Goal: test04 architecture + dropout + max steps within 5x budget
-Run: python train.py --steps 2400 --run-dir runs/test07
+Ablation results:
+  test02: RoPE+RMSNorm+SwiGLU+w160+d6+resid_scale -> 1.7712 BPB
+  test04: + QK-Norm                                 -> 1.7619 BPB
 """
 import math
 import torch
@@ -55,42 +54,39 @@ def _apply_rope(x, cos, sin):
 
 class SwiGLUMLP(nn.Module):
     """Gated MLP: SiLU(gate) * up -> down  (Shazeer 2020, LLaMA)."""
-    def __init__(self, width, hidden_dim, dropout=0.0):
+    def __init__(self, width, hidden_dim):
         super().__init__()
         self.gate = nn.Linear(width, hidden_dim, bias=False)
         self.up   = nn.Linear(width, hidden_dim, bias=False)
         self.down = nn.Linear(hidden_dim, width, bias=False)
-        self.drop = nn.Dropout(dropout)
 
     def forward(self, x):
-        return self.drop(self.down(F.silu(self.gate(x)) * self.up(x)))
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 # ---------------------------------------------------------------------------
-# Transformer block: MHA + QK-Norm + Dropout (no GQA for small models)
+# Transformer block (sequential, with QK-Norm)
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    def __init__(self, width, heads, mlp_hidden, residual_scale=1.0, dropout=0.0):
+    def __init__(self, width, heads, mlp_hidden, residual_scale=1.0):
         super().__init__()
         self.heads = heads
         self.head_dim = width // heads
         self.residual_scale = residual_scale
-
         self.norm1 = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.qkv  = nn.Linear(width, 3 * width, bias=False)
-
-        # QK-Norm (Gemma 2 / DeepSeek-V2)
+        # QK-Norm: normalize Q and K per-head before attention (Gemma 2)
+        # Prevents attention logit explosion in deeper models
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
-
         self.proj = nn.Linear(width, width, bias=False)
-        self.attn_drop = nn.Dropout(dropout)
-        self.mlp  = SwiGLUMLP(width, mlp_hidden, dropout)
+        self.mlp  = SwiGLUMLP(width, mlp_hidden)
 
     def forward(self, x, rope_cos, rope_sin):
         batch, length, width = x.shape
+        # --- self-attention with QK-Norm + RoPE ---
         h = self.norm1(x)
         q, k, v = (self.qkv(h)
                     .view(batch, length, 3, self.heads, self.head_dim)
@@ -98,7 +94,8 @@ class Block(nn.Module):
         q = _apply_rope(self.q_norm(q), rope_cos, rope_sin)
         k = _apply_rope(self.k_norm(k), rope_cos, rope_sin)
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.attn_drop(self.proj(attn.transpose(1, 2).reshape(batch, length, width))) * self.residual_scale
+        x = x + self.proj(attn.transpose(1, 2).reshape(batch, length, width)) * self.residual_scale
+        # --- feed-forward (sequential, sees post-attention features) ---
         x = x + self.mlp(self.norm2(x)) * self.residual_scale
         return x
 
@@ -115,7 +112,6 @@ class StudentGPT(nn.Module):
         width = config['width']
         heads = config['heads']
         depth = config.get('depth', 4)
-        dropout = config.get('dropout', 0.0)
 
         # SwiGLU hidden dim: 8/3 * width, rounded to multiple of 8
         mlp_hidden = ((width * 8 // 3 + 7) // 8) * 8
@@ -123,9 +119,8 @@ class StudentGPT(nn.Module):
         # Residual scaling: 1/sqrt(depth)
         residual_scale = 1.0 / math.sqrt(depth)
 
-        # Embedding + dropout
+        # Token embedding (RoPE handles positions)
         self.token = nn.Embedding(config['vocab'], width)
-        self.embed_drop = nn.Dropout(dropout)
 
         # RoPE cos/sin tables
         head_dim = width // heads
@@ -134,10 +129,9 @@ class StudentGPT(nn.Module):
         self.register_buffer('rope_sin', sin)
 
         # Transformer blocks
-        self.blocks = nn.ModuleList([
-            Block(width, heads, mlp_hidden, residual_scale, dropout)
-            for _ in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [Block(width, heads, mlp_hidden, residual_scale) for _ in range(depth)]
+        )
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, config['vocab'], bias=False)
 
@@ -153,7 +147,7 @@ class StudentGPT(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def features(self, ids):
-        x = self.embed_drop(self.token(ids))
+        x = self.token(ids)
         for block in self.blocks:
             x = block(x, self.rope_cos, self.rope_sin)
         return self.norm(x)
@@ -173,8 +167,7 @@ class StudentGPT(nn.Module):
 
 def build_model(config):
     improved = dict(config)
-    improved['width']   = 160   # wider:  128 -> 160
-    improved['heads']   = 5     # 5 heads (head_dim = 32)
-    improved['depth']   = 6     # deeper: 4 -> 6
-    improved['dropout'] = 0.05  # light regularization
+    improved['width'] = 160     # wider:  128 -> 160
+    improved['heads'] = 5       # heads:  4 -> 5  (head_dim = 32)
+    improved['depth'] = 6       # deeper: 4 -> 6 blocks
     return StudentGPT(improved)
