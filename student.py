@@ -1,27 +1,9 @@
-"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU + QK-Norm, wider & deeper.
-
-Improvements over baseline (GPT-2 style, width=128, depth=4, ~1.09M params):
-  1. RoPE           – rotary position encoding (LLaMA)
-  2. RMSNorm        – simpler norm, no mean-centering (LLaMA)
-  3. SwiGLU         – gated MLP with SiLU activation (LLaMA/PaLM)
-  4. Width 160      – wider representations (128 -> 160)
-  5. Depth 6        – deeper network (4 -> 6 blocks)
-  6. Residual scale – each residual branch *= 1/sqrt(depth) (DeepSeek-V2)
-  7. QK-Norm        – RMSNorm on Q,K before attention (Gemma 2 / DeepSeek-V2)
-
-Ablation results:
-  test02: RoPE+RMSNorm+SwiGLU+w160+d6+resid_scale -> 1.7712 BPB
-  test04: + QK-Norm                                 -> 1.7619 BPB
-"""
+"""Compact gated-attention GPT for the MP1 next-token task."""
 import math
 import torch
 from torch import nn
 from torch.nn import functional as F
 
-
-# ---------------------------------------------------------------------------
-# Components
-# ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
     """RMSNorm (Zhang & Sennrich, 2019). No mean-centering, no bias."""
@@ -64,29 +46,24 @@ class SwiGLUMLP(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
-# ---------------------------------------------------------------------------
-# Transformer block (sequential, with QK-Norm)
-# ---------------------------------------------------------------------------
-
 class Block(nn.Module):
     def __init__(self, width, heads, mlp_hidden, residual_scale=1.0):
         super().__init__()
         self.heads = heads
         self.head_dim = width // heads
         self.residual_scale = residual_scale
+
         self.norm1 = RMSNorm(width)
         self.norm2 = RMSNorm(width)
         self.qkv  = nn.Linear(width, 3 * width, bias=False)
-        # QK-Norm: normalize Q and K per-head before attention (Gemma 2)
-        # Prevents attention logit explosion in deeper models
         self.q_norm = RMSNorm(self.head_dim)
         self.k_norm = RMSNorm(self.head_dim)
         self.proj = nn.Linear(width, width, bias=False)
+        self.attn_gate = nn.Linear(width, heads)
         self.mlp  = SwiGLUMLP(width, mlp_hidden)
 
     def forward(self, x, rope_cos, rope_sin):
         batch, length, width = x.shape
-        # --- self-attention with QK-Norm + RoPE ---
         h = self.norm1(x)
         q, k, v = (self.qkv(h)
                     .view(batch, length, 3, self.heads, self.head_dim)
@@ -94,8 +71,10 @@ class Block(nn.Module):
         q = _apply_rope(self.q_norm(q), rope_cos, rope_sin)
         k = _apply_rope(self.k_norm(k), rope_cos, rope_sin)
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        x = x + self.proj(attn.transpose(1, 2).reshape(batch, length, width)) * self.residual_scale
-        # --- feed-forward (sequential, sees post-attention features) ---
+        gate = torch.sigmoid(self.attn_gate(h)).transpose(1, 2).unsqueeze(-1)
+        attn = attn * gate
+        attn_out = self.proj(attn.transpose(1, 2).reshape(batch, length, width))
+        x = x + attn_out * self.residual_scale
         x = x + self.mlp(self.norm2(x)) * self.residual_scale
         return x
 
@@ -113,30 +92,25 @@ class StudentGPT(nn.Module):
         heads = config['heads']
         depth = config.get('depth', 4)
 
-        # SwiGLU hidden dim: 8/3 * width, rounded to multiple of 8
         mlp_hidden = ((width * 8 // 3 + 7) // 8) * 8
-
-        # Residual scaling: 1/sqrt(depth)
         residual_scale = 1.0 / math.sqrt(depth)
 
-        # Token embedding (RoPE handles positions)
         self.token = nn.Embedding(config['vocab'], width)
 
-        # RoPE cos/sin tables
         head_dim = width // heads
         cos, sin = _precompute_rope(head_dim, self.context)
         self.register_buffer('rope_cos', cos)
         self.register_buffer('rope_sin', sin)
 
-        # Transformer blocks
         self.blocks = nn.ModuleList(
             [Block(width, heads, mlp_hidden, residual_scale) for _ in range(depth)]
         )
         self.norm = RMSNorm(width)
         self.head = nn.Linear(width, config['vocab'], bias=False)
 
-        # Initialize and tie embeddings
         self.apply(self._init_weights)
+        for block in self.blocks:
+            nn.init.constant_(block.attn_gate.bias, 2.0)
         self.head.weight = self.token.weight
 
     @staticmethod
@@ -167,7 +141,7 @@ class StudentGPT(nn.Module):
 
 def build_model(config):
     improved = dict(config)
-    improved['width'] = 160     # wider:  128 -> 160
-    improved['heads'] = 5       # heads:  4 -> 5  (head_dim = 32)
-    improved['depth'] = 6       # deeper: 4 -> 6 blocks
+    improved['width'] = 160
+    improved['heads'] = 5
+    improved['depth'] = 6
     return StudentGPT(improved)
