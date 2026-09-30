@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/Users/yuc/miniconda3/envs/mp1/bin/python -c \"\nimport json\nresults = {}\nfor d in ['baseline','test01','test02','test03','test04','test04_steps','test05']:\n    try:\n        m = json.load\\(open\\(f'runs/{d}/metrics.json'\\)\\)\n        steps = m['train_tokens'] // 32 // 256\n        results[d] = \\(m['validation']['bpb'], m['train_seconds'], steps\\)\n    except: pass\nprint\\(f'{'Run':<15} {'Val BPB':>8} {'Time\\(s\\)':>8} {'Steps':>6} {'s/step':>7}'\\)\nprint\\('-'*50\\)\nfor k,\\(bpb,t,s\\) in results.items\\(\\):\n    print\\(f'{k:<15} {bpb:>8.4f} {t:>8.1f} {s:>6} {t/s:>7.4f}'\\)\nprint\\(\\)\nprint\\(f'Time budget \\(5x baseline\\): {results[\\\\\"baseline\\\\\"][1]*5:.0f}s'\\)\n\")"
+    ]
+  }
+}
