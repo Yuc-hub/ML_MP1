@@ -1,4 +1,4 @@
-"""LLaMA-style GPT with modern techniques from LLaMA 2/3, Gemma 2, DeepSeek.
+"""LLaMA-style GPT: RoPE + RMSNorm + SwiGLU + QK-Norm + Dropout.
 
 Improvements over baseline (GPT-2 style, width=128, depth=4, ~1.09M params):
   1. RoPE           – rotary position encoding (LLaMA)
@@ -7,12 +7,12 @@ Improvements over baseline (GPT-2 style, width=128, depth=4, ~1.09M params):
   4. Width 160      – wider representations
   5. Depth 6        – deeper network
   6. Residual scale – 1/sqrt(depth) per residual branch (DeepSeek-V2)
-  7. QK-Norm        – RMSNorm on Q,K before attention (Gemma 2 / DeepSeek-V2)
-  8. Dropout 0.1    – regularization on attn/MLP/embedding
-  9. GQA            – grouped query attention: 5 Q heads, 1 KV head (LLaMA 2/3)
-  10. Wider MLP     – reinvest GQA param savings into MLP capacity
+  7. QK-Norm        – RMSNorm on Q,K before attention (Gemma 2)
+  8. Dropout 0.05   – light regularization on attn/MLP/embedding
 
-Run: python train.py --steps 2400 --run-dir runs/test06
+Best so far: test04 = 1.7619 BPB (1200 steps, no dropout)
+Goal: test04 architecture + dropout + max steps within 5x budget
+Run: python train.py --steps 2400 --run-dir runs/test07
 """
 import math
 import torch
@@ -67,25 +67,19 @@ class SwiGLUMLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Transformer block with GQA (Grouped Query Attention, LLaMA 2/3)
+# Transformer block: MHA + QK-Norm + Dropout (no GQA for small models)
 # ---------------------------------------------------------------------------
 
 class Block(nn.Module):
-    def __init__(self, width, n_heads, n_kv_heads, mlp_hidden,
-                 residual_scale=1.0, dropout=0.0):
+    def __init__(self, width, heads, mlp_hidden, residual_scale=1.0, dropout=0.0):
         super().__init__()
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.head_dim = width // n_heads
-        self.kv_group_size = n_heads // n_kv_heads  # Q heads per KV head
+        self.heads = heads
+        self.head_dim = width // heads
         self.residual_scale = residual_scale
 
         self.norm1 = RMSNorm(width)
         self.norm2 = RMSNorm(width)
-
-        # GQA: separate Q and KV projections (LLaMA 2/3)
-        self.q_proj  = nn.Linear(width, n_heads * self.head_dim, bias=False)
-        self.kv_proj = nn.Linear(width, 2 * n_kv_heads * self.head_dim, bias=False)
+        self.qkv  = nn.Linear(width, 3 * width, bias=False)
 
         # QK-Norm (Gemma 2 / DeepSeek-V2)
         self.q_norm = RMSNorm(self.head_dim)
@@ -93,36 +87,18 @@ class Block(nn.Module):
 
         self.proj = nn.Linear(width, width, bias=False)
         self.attn_drop = nn.Dropout(dropout)
-        self.mlp = SwiGLUMLP(width, mlp_hidden, dropout)
+        self.mlp  = SwiGLUMLP(width, mlp_hidden, dropout)
 
     def forward(self, x, rope_cos, rope_sin):
         batch, length, width = x.shape
         h = self.norm1(x)
-
-        # Q: [batch, n_heads, length, head_dim]
-        q = (self.q_proj(h)
-             .view(batch, length, self.n_heads, self.head_dim)
-             .transpose(1, 2))
-        # KV: [batch, n_kv_heads, length, head_dim] each
-        kv = (self.kv_proj(h)
-              .view(batch, length, 2, self.n_kv_heads, self.head_dim)
-              .permute(2, 0, 3, 1, 4))
-        k, v = kv[0], kv[1]
-
-        # QK-Norm + RoPE
+        q, k, v = (self.qkv(h)
+                    .view(batch, length, 3, self.heads, self.head_dim)
+                    .permute(2, 0, 3, 1, 4))
         q = _apply_rope(self.q_norm(q), rope_cos, rope_sin)
         k = _apply_rope(self.k_norm(k), rope_cos, rope_sin)
-
-        # Expand KV heads to match Q heads (GQA broadcast)
-        if self.kv_group_size > 1:
-            k = k.unsqueeze(2).expand(-1, -1, self.kv_group_size, -1, -1)
-            k = k.reshape(batch, self.n_heads, length, self.head_dim)
-            v = v.unsqueeze(2).expand(-1, -1, self.kv_group_size, -1, -1)
-            v = v.reshape(batch, self.n_heads, length, self.head_dim)
-
         attn = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        out = attn.transpose(1, 2).reshape(batch, length, width)
-        x = x + self.attn_drop(self.proj(out)) * self.residual_scale
+        x = x + self.attn_drop(self.proj(attn.transpose(1, 2).reshape(batch, length, width))) * self.residual_scale
         x = x + self.mlp(self.norm2(x)) * self.residual_scale
         return x
 
@@ -137,14 +113,12 @@ class StudentGPT(nn.Module):
         self.config = dict(config)
         self.context = config['context']
         width = config['width']
-        n_heads = config['heads']
-        n_kv_heads = config.get('kv_heads', n_heads)
+        heads = config['heads']
         depth = config.get('depth', 4)
         dropout = config.get('dropout', 0.0)
 
-        # SwiGLU hidden dim, rounded to multiple of 8
-        mlp_ratio = config.get('mlp_ratio', 8 / 3)
-        mlp_hidden = ((int(width * mlp_ratio) + 7) // 8) * 8
+        # SwiGLU hidden dim: 8/3 * width, rounded to multiple of 8
+        mlp_hidden = ((width * 8 // 3 + 7) // 8) * 8
 
         # Residual scaling: 1/sqrt(depth)
         residual_scale = 1.0 / math.sqrt(depth)
@@ -154,14 +128,14 @@ class StudentGPT(nn.Module):
         self.embed_drop = nn.Dropout(dropout)
 
         # RoPE cos/sin tables
-        head_dim = width // n_heads
+        head_dim = width // heads
         cos, sin = _precompute_rope(head_dim, self.context)
         self.register_buffer('rope_cos', cos)
         self.register_buffer('rope_sin', sin)
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
-            Block(width, n_heads, n_kv_heads, mlp_hidden, residual_scale, dropout)
+            Block(width, heads, mlp_hidden, residual_scale, dropout)
             for _ in range(depth)
         ])
         self.norm = RMSNorm(width)
@@ -199,10 +173,8 @@ class StudentGPT(nn.Module):
 
 def build_model(config):
     improved = dict(config)
-    improved['width']     = 160   # wider:  128 -> 160
-    improved['heads']     = 5     # Q heads: 5  (head_dim = 32)
-    improved['kv_heads']  = 1     # KV heads: 1  (GQA, LLaMA 2/3 style)
-    improved['depth']     = 6     # deeper: 4 -> 6
-    improved['dropout']   = 0.1   # regularization
-    improved['mlp_ratio'] = 3.5   # wider MLP (reinvest GQA param savings)
+    improved['width']   = 160   # wider:  128 -> 160
+    improved['heads']   = 5     # 5 heads (head_dim = 32)
+    improved['depth']   = 6     # deeper: 4 -> 6
+    improved['dropout'] = 0.05  # light regularization
     return StudentGPT(improved)
